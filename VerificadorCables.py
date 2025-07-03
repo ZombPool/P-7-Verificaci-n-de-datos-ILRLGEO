@@ -23,6 +23,12 @@ class VerificadorCables:
         self.config_file = "config.json"
         self.password = "admin123" # Contraseña para acceder a la configuración
         
+        # Variables para almacenar la última información analizada (para detalles)
+        self.last_ilrl_analysis_data = None
+        self.last_ilrl_file_path = None
+        self.last_geo_analysis_data = None
+        self.last_geo_file_path = None
+        
         self.cargar_rutas() # Cargar las rutas al iniciar la aplicación
 
     def cargar_rutas(self):
@@ -62,25 +68,35 @@ class VerificadorCables:
         return None
 
     def leer_resultado_ilrl(self, ruta):
-        """Método para leer resultados ILRL"""
+        """
+        Método para leer resultados ILRL.
+        Retorna: resultado_final, ultima_fecha, df_original, col_resultado, col_fecha
+        """
         try:
             df = pd.read_excel(ruta, header=None)
             inicio = 12
 
+            # Intentar determinar la columna de resultados dinámicamente
             col7_vals = df.iloc[inicio:, 7].dropna().astype(str).str.upper()
             col8_vals = df.iloc[inicio:, 8].dropna().astype(str).str.upper()
 
-            count_col7 = col7_vals.isin(['PASS', 'FAIL']).sum()
-            count_col8 = col8_vals.isin(['PASS', 'FAIL']).sum()
+            count_col7_pass_fail = col7_vals.isin(['PASS', 'FAIL']).sum()
+            count_col8_pass_fail = col8_vals.isin(['PASS', 'FAIL']).sum()
 
-            col_resultado = 8 if count_col8 >= count_col7 else 7
-            col_fecha = 10 if col_resultado == 8 else 9
+            if count_col8_pass_fail >= count_col7_pass_fail and count_col8_pass_fail > 0:
+                col_resultado = 8
+                col_fecha = 10
+            elif count_col7_pass_fail > 0:
+                col_resultado = 7
+                col_fecha = 9
+            else: # No se encontraron 'PASS'/'FAIL' en las columnas esperadas
+                return None, None, None, None, None
 
             resultados = df.iloc[inicio:, col_resultado].dropna().astype(str).str.upper().tolist()
             fechas_raw = df.iloc[inicio:, col_fecha].dropna().tolist()
 
             if not resultados:
-                return None, None
+                return None, None, None, None, None
 
             resultado_final = 'APROBADO' if all(r == 'PASS' for r in resultados) else 'RECHAZADO'
 
@@ -90,15 +106,18 @@ class VerificadorCables:
                     if isinstance(f, datetime):
                         fechas_datetime.append(f)
                     else:
-                        fechas_datetime.append(datetime.strptime(str(f), "%d/%m/%Y %H:%M"))
-                except:
-                    pass
+                        fechas_datetime.append(datetime.strptime(str(f).split('.')[0], "%d/%m/%Y %H:%M")) # Ajuste para formato
+                except ValueError:
+                    try:
+                        fechas_datetime.append(datetime.strptime(str(f).split('.')[0], "%Y-%m-%d %H:%M:%S")) # Otro formato común
+                    except:
+                        pass # Ignorar fechas no parseables
 
-            ultima_fecha = max(fechas_datetime).strftime("%d/%m/%Y %H:%M") if fechas_datetime else ''
-            return resultado_final, ultima_fecha
+            ultima_fecha = max(fechas_datetime).strftime("%d/%m/%Y %H:%M") if fechas_datetime else 'N/A'
+            return resultado_final, ultima_fecha, df, col_resultado, col_fecha
         except Exception as e:
             print(f"Error leyendo {os.path.basename(ruta)}: {e}")
-            return None, None
+            return None, None, None, None, None
 
     def normalizar_serie_geo(self, serie_completo):
         """Método para normalizar serie de geometría"""
@@ -117,7 +136,10 @@ class VerificadorCables:
         return serie, punta if punta in {'1','2','3','4','R1','R2','R3','R4'} else None
 
     def leer_resultado_geo(self, ruta):
-        """Método para leer resultados de geometría"""
+        """
+        Método para leer resultados de geometría.
+        Retorna: resultados_por_serie, ultima_fecha, df_procesado
+        """
         try:
             df = pd.read_excel(ruta, header=None, skiprows=12)
             datos = []
@@ -134,12 +156,27 @@ class VerificadorCables:
                 timestamp = None
                 try:
                     if fecha and hora:
-                        if isinstance(fecha, str) and isinstance(hora, str):
-                            timestamp = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M:%S")
-                        elif isinstance(fecha, datetime) and isinstance(hora, datetime):
-                            timestamp = datetime.combine(fecha.date(), hora.time())
-                        elif isinstance(fecha, datetime):
-                            timestamp = fecha
+                        if isinstance(fecha, datetime):
+                            if isinstance(hora, datetime): # Hora ya es datetime
+                                timestamp = datetime.combine(fecha.date(), hora.time())
+                            elif isinstance(hora, (float, int)): # Hora como número de serie de Excel
+                                timestamp = fecha + pd.to_timedelta(hora, unit='D')
+                            else: # Hora como string
+                                hora_str = str(hora).split('.')[0] # Eliminar milisegundos si hay
+                                timestamp = datetime.strptime(f"{fecha.strftime('%Y-%m-%d')} {hora_str}", "%Y-%m-%d %H:%M:%S")
+                        elif isinstance(fecha, (float, int)): # Fecha como número de serie de Excel
+                            base_date = datetime(1899, 12, 30) # Excel epoch date for Windows
+                            if fecha < 60: # Handling Excel leap year bug for 1900
+                                fecha -= 1
+                            timestamp = base_date + pd.to_timedelta(fecha, unit='D')
+                            if isinstance(hora, (float, int)):
+                                timestamp += pd.to_timedelta(hora, unit='D')
+                            else:
+                                hora_str = str(hora).split('.')[0]
+                                timestamp = datetime.strptime(f"{timestamp.strftime('%Y-%m-%d')} {hora_str}", "%Y-%m-%d %H:%M:%S")
+
+                        elif isinstance(fecha, str) and isinstance(hora, str):
+                            timestamp = datetime.strptime(f"{fecha.split('.')[0]} {hora.split('.')[0]}", "%Y-%m-%d %H:%M:%S")
                 except Exception as e:
                     pass
                     
@@ -152,21 +189,32 @@ class VerificadorCables:
             
             df_procesado = pd.DataFrame(datos)
             if df_procesado.empty:
-                return None, None
+                return None, None, None
             
             # Determinar estado final por serie
             resultados_por_serie = {}
             for serie, grupo in df_procesado.groupby('Serie'):
                 ultima_medicion_por_punta = {}
                 
+                # Obtener la última medición para cada punta física (1, 2, 3, 4)
                 for _, medicion in grupo.iterrows():
                     punta = medicion['Punta']
-                    punta_fisica = punta.replace('R', '')
+                    punta_fisica = punta.replace('R', '') # Ignorar 'R' para identificar la punta física
                     
-                    if punta_fisica not in ultima_medicion_por_punta:
+                    # Si no existe o la nueva es más reciente
+                    if punta_fisica not in ultima_medicion_por_punta or \
+                       (medicion['Timestamp'] and ultima_medicion_por_punta[punta_fisica]['Timestamp'] and \
+                        medicion['Timestamp'] > ultima_medicion_por_punta[punta_fisica]['Timestamp']):
                         ultima_medicion_por_punta[punta_fisica] = {
-                            'Punta': punta,
-                            'Resultado': medicion['Resultado'] == 'PASS'
+                            'Punta': punta, # Guardar la original (ej. R1)
+                            'Resultado': medicion['Resultado'] == 'PASS',
+                            'Timestamp': medicion['Timestamp']
+                        }
+                    elif not ultima_medicion_por_punta[punta_fisica]['Timestamp'] and medicion['Timestamp']:
+                         ultima_medicion_por_punta[punta_fisica] = {
+                            'Punta': punta, # Guardar la original (ej. R1)
+                            'Resultado': medicion['Resultado'] == 'PASS',
+                            'Timestamp': medicion['Timestamp']
                         }
                 
                 estado_final = "APROBADO"
@@ -174,15 +222,16 @@ class VerificadorCables:
                     if p in ultima_medicion_por_punta:
                         if not ultima_medicion_por_punta[p]['Resultado']:
                             estado_final = "RECHAZADO"
-                    else:
+                    else: # Si falta alguna punta
                         estado_final = "RECHAZADO"
-                
+                        
                 resultados_por_serie[serie] = estado_final
             
-            return resultados_por_serie, df_procesado['Timestamp'].max()
+            ultima_fecha_total = df_procesado['Timestamp'].max()
+            return resultados_por_serie, ultima_fecha_total, df_procesado
         except Exception as e:
             print(f"Error leyendo {os.path.basename(ruta)}: {e}")
-            return None, None
+            return None, None, None
 
     def buscar_archivos_ilrl(self, ot_numero):
         """Busca archivos ILRL para la OT especificada"""
@@ -214,11 +263,20 @@ class VerificadorCables:
             self.resultado_text.config(state=tk.NORMAL)
             self.resultado_text.delete(1.0, tk.END)
             self.resultado_text.insert(tk.END, "Esperando un número de serie de 13 dígitos para iniciar la verificación...", "normal")
+            # Quitar bindings de tags anteriores
+            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
 
     def verificar_cable(self):
         ot_numero = self.ot_entry.get().strip().upper()
         serie_cable = self.serie_entry.get().strip()
+        
+        # Limpiar datos de análisis previos
+        self.last_ilrl_analysis_data = None
+        self.last_ilrl_file_path = None
+        self.last_geo_analysis_data = None
+        self.last_geo_file_path = None
         
         # Actualizar información de rutas en la interfaz
         self.ruta_ilrl_label.config(text=f"📂 Ruta ILRL: {self.ruta_base_ilrl}")
@@ -228,6 +286,8 @@ class VerificadorCables:
             self.resultado_text.config(state=tk.NORMAL)
             self.resultado_text.delete(1.0, tk.END)
             self.resultado_text.insert(tk.END, "Por favor, ingrese OT y Número de Serie para verificar.", "normal")
+            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
             return
         
@@ -235,6 +295,8 @@ class VerificadorCables:
             self.resultado_text.config(state=tk.NORMAL)
             self.resultado_text.delete(1.0, tk.END)
             self.resultado_text.insert(tk.END, "El número de serie debe tener 13 dígitos para realizar la verificación.", "rojo")
+            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
             return
         
@@ -243,6 +305,8 @@ class VerificadorCables:
             self.resultado_text.config(state=tk.NORMAL)
             self.resultado_text.delete(1.0, tk.END)
             self.resultado_text.insert(tk.END, f"NO SE ENCONTRARON ARCHIVOS ILRL PARA LA OT {ot_numero}\n", "rojo")
+            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
             return
         
@@ -251,6 +315,8 @@ class VerificadorCables:
             self.resultado_text.config(state=tk.NORMAL)
             self.resultado_text.delete(1.0, tk.END)
             self.resultado_text.insert(tk.END, f"NO SE ENCONTRARON ARCHIVOS DE GEOMETRÍA PARA LA OT {ot_numero}\n", "rojo")
+            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
             return
         
@@ -258,41 +324,76 @@ class VerificadorCables:
         serie_buscar_ilrl = serie_cable[-4:]
         resultado_ilrl = None
         fecha_ilrl = None
+        df_ilrl_original = None
+        col_ilrl_resultado = None
+        col_ilrl_fecha = None
         
         for archivo in archivos_ilrl:
             clave = self.extraer_clave_ilrl(os.path.basename(archivo))
             if clave and clave.split('-')[1] == serie_buscar_ilrl:
-                res, fecha = self.leer_resultado_ilrl(archivo)
+                res, fecha, df_orig, col_res, col_fecha = self.leer_resultado_ilrl(archivo)
                 if res:
                     resultado_ilrl = res
                     fecha_ilrl = fecha
+                    df_ilrl_original = df_orig
+                    col_ilrl_resultado = col_res
+                    col_ilrl_fecha = col_fecha
+                    self.last_ilrl_file_path = archivo # Almacenar la ruta
                     break
+        
+        # Almacenar datos para ILRL
+        self.last_ilrl_analysis_data = {
+            'df': df_ilrl_original,
+            'col_resultado': col_ilrl_resultado,
+            'col_fecha': col_ilrl_fecha,
+            'resultado_general': resultado_ilrl,
+            'fecha_general': fecha_ilrl
+        }
         
         # Procesar Geometría (buscamos el número de serie completo)
         resultado_geo = None
         fecha_geo = None
+        df_geo_procesado = None
         
         for archivo in archivos_geo:
-            res_dict, fecha = self.leer_resultado_geo(archivo)
+            res_dict, fecha, df_proc = self.leer_resultado_geo(archivo)
             if res_dict and serie_cable in res_dict:
                 resultado_geo = res_dict[serie_cable]
                 fecha_geo = fecha
+                df_geo_procesado = df_proc
+                self.last_geo_file_path = archivo # Almacenar la ruta
                 break
         
+        # Almacenar datos para Geometría
+        self.last_geo_analysis_data = {
+            'df_procesado': df_geo_procesado,
+            'resultado_general': resultado_geo,
+            'fecha_general': fecha_geo,
+            'serie_cable': serie_cable
+        }
+
         # Mostrar resultados con formato
         self.resultado_text.config(state=tk.NORMAL)
         self.resultado_text.delete(1.0, tk.END)
         
+        # Quitar bindings de tags anteriores para evitar múltiples llamadas
+        self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
+        self.resultado_text.tag_unbind("geo_click", "<Button-1>")
+
         # Encabezado
         self.resultado_text.insert(tk.END, f"🔍 Resultados para cable {serie_cable} en OT {ot_numero}:\n\n", "header")
         
         # Resultado ILRL
         self.resultado_text.insert(tk.END, "📊 ILRL: ", "bold")
         if resultado_ilrl:
-            color = "verde" if resultado_ilrl == "APROBADO" else "rojo"
-            self.resultado_text.insert(tk.END, f"{resultado_ilrl}", color)
+            color_tag = "verde" if resultado_ilrl == "APROBADO" else "rojo"
+            # Aplica el tag de color y el tag de click
+            self.resultado_text.insert(tk.END, f"{resultado_ilrl}", (color_tag, "ilrl_click"))
             if fecha_ilrl:
                 self.resultado_text.insert(tk.END, f" (📅 {fecha_ilrl})", "normal")
+            # Vincula el tag a la función de detalles
+            self.resultado_text.tag_bind("ilrl_click", "<Button-1>", lambda e: self.mostrar_detalles_ilrl())
+            self.resultado_text.tag_config("ilrl_click", underline=1) # SOLO SUBRAYADO, SIN CAMBIAR EL COLOR
         else:
             self.resultado_text.insert(tk.END, f"NO ENCONTRADO (buscando terminación {serie_buscar_ilrl})", "rojo")
         self.resultado_text.insert(tk.END, "\n")
@@ -300,11 +401,15 @@ class VerificadorCables:
         # Resultado Geometría
         self.resultado_text.insert(tk.END, "📐 Geometría: ", "bold")
         if resultado_geo:
-            color = "verde" if resultado_geo == "APROBADO" else "rojo"
-            self.resultado_text.insert(tk.END, f"{resultado_geo}", color)
+            color_tag = "verde" if resultado_geo == "APROBADO" else "rojo"
+            # Aplica el tag de color y el tag de click
+            self.resultado_text.insert(tk.END, f"{resultado_geo}", (color_tag, "geo_click"))
             if fecha_geo:
                 fecha_str = fecha_geo.strftime('%d/%m/%Y %H:%M') if hasattr(fecha_geo, 'strftime') else str(fecha_geo)
                 self.resultado_text.insert(tk.END, f" (📅 {fecha_str})", "normal")
+            # Vincula el tag a la función de detalles
+            self.resultado_text.tag_bind("geo_click", "<Button-1>", lambda e: self.mostrar_detalles_geo())
+            self.resultado_text.tag_config("geo_click", underline=1) # SOLO SUBRAYADO, SIN CAMBIAR EL COLOR
         else:
             self.resultado_text.insert(tk.END, "NO ENCONTRADA", "rojo")
         self.resultado_text.insert(tk.END, "\n\n")
@@ -328,6 +433,157 @@ class VerificadorCables:
             self.resultado_text.insert(tk.END, "❌ No se pudo verificar completamente el cable.\n", "rojo")
 
         self.resultado_text.config(state=tk.DISABLED)
+
+    def mostrar_detalles_ilrl(self):
+        if not self.last_ilrl_analysis_data or not self.last_ilrl_file_path:
+            messagebox.showinfo("Detalles ILRL", "No hay datos de ILRL para mostrar detalles. Realice una verificación primero.")
+            return
+
+        detalles_window = tk.Toplevel(self.root)
+        detalles_window.title("Detalles de Verificación ILRL")
+        detalles_window.geometry("700x500")
+        detalles_window.transient(self.root)
+        detalles_window.grab_set()
+
+        frame = ttk.Frame(detalles_window, padding=(20, 20), style="TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Ruta del archivo
+        ttk.Label(frame, text="📁 Archivo Analizado:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+        ttk.Label(frame, text=self.last_ilrl_file_path, wraplength=650, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w", pady=(0, 10))
+
+        # Resultado general y fecha
+        ttk.Label(frame, text="📈 Resultado General ILRL:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+        
+        resultado_general = self.last_ilrl_analysis_data['resultado_general']
+        fecha_general = self.last_ilrl_analysis_data['fecha_general']
+        color = "green" if resultado_general == "APROBADO" else "red"
+        
+        info_label = ttk.Label(frame, text=f"{resultado_general} (Fecha de medición más reciente: {fecha_general})", 
+                               font=("Arial", 10, "bold"), foreground=color, background="#F0F4F8")
+        info_label.pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(frame, text="📊 Mediciones Detalladas por Línea:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+
+        # Tabla de mediciones detalladas
+        tree = ttk.Treeview(frame, columns=("Línea", "Resultado", "Fecha"), show="headings", height=10)
+        tree.heading("Línea", text="Línea", anchor=tk.W)
+        tree.heading("Resultado", text="Resultado", anchor=tk.W)
+        tree.heading("Fecha", text="Fecha", anchor=tk.W)
+
+        tree.column("Línea", width=70, stretch=tk.NO)
+        tree.column("Resultado", width=100, stretch=tk.NO)
+        tree.column("Fecha", width=180, stretch=tk.NO)
+
+        df = self.last_ilrl_analysis_data['df']
+        col_resultado = self.last_ilrl_analysis_data['col_resultado']
+        col_fecha = self.last_ilrl_analysis_data['col_fecha']
+        inicio = 12 # Fila de inicio de los datos
+
+        if df is not None and col_resultado is not None and col_fecha is not None:
+            for i in range(inicio, len(df)):
+                try:
+                    resultado = str(df.iloc[i, col_resultado]).strip().upper()
+                    fecha_raw = df.iloc[i, col_fecha]
+                    fecha_str = 'N/A'
+                    if isinstance(fecha_raw, datetime):
+                        fecha_str = fecha_raw.strftime("%d/%m/%Y %H:%M")
+                    else:
+                        try:
+                            fecha_str = datetime.strptime(str(fecha_raw).split('.')[0], "%d/%m/%Y %H:%M").strftime("%d/%m/%Y %H:%M")
+                        except:
+                            try:
+                                fecha_str = datetime.strptime(str(fecha_raw).split('.')[0], "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y %H:%M")
+                            except:
+                                pass # No se pudo parsear
+                    
+                    if resultado in ['PASS', 'FAIL']:
+                        tree.insert("", tk.END, values=(i - inicio + 1, resultado, fecha_str), 
+                                    tags=('pass_style' if resultado == 'PASS' else 'fail_style'))
+                except IndexError:
+                    continue # Saltar si la fila no tiene suficientes columnas
+        
+        # Configurar estilos para las filas de Treeview
+        tree.tag_configure('pass_style', foreground='green')
+        tree.tag_configure('fail_style', foreground='red')
+
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        detalles_window.mainloop()
+
+    def mostrar_detalles_geo(self):
+        if not self.last_geo_analysis_data or not self.last_geo_file_path:
+            messagebox.showinfo("Detalles Geometría", "No hay datos de Geometría para mostrar detalles. Realice una verificación primero.")
+            return
+
+        detalles_window = tk.Toplevel(self.root)
+        detalles_window.title("Detalles de Verificación Geometría")
+        detalles_window.geometry("700x500")
+        detalles_window.transient(self.root)
+        detalles_window.grab_set()
+
+        frame = ttk.Frame(detalles_window, padding=(20, 20), style="TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Ruta del archivo
+        ttk.Label(frame, text="📁 Archivo Analizado:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+        ttk.Label(frame, text=self.last_geo_file_path, wraplength=650, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w", pady=(0, 10))
+
+        # Resultado general y fecha
+        ttk.Label(frame, text=f"📈 Resultado General para Serie {self.last_geo_analysis_data['serie_cable']}:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+        
+        resultado_general = self.last_geo_analysis_data['resultado_general']
+        fecha_general = self.last_geo_analysis_data['fecha_general']
+        color = "green" if resultado_general == "APROBADO" else "red"
+        
+        fecha_str_disp = fecha_general.strftime("%d/%m/%Y %H:%M") if hasattr(fecha_general, 'strftime') else str(fecha_general)
+        info_label = ttk.Label(frame, text=f"{resultado_general} (Fecha de medición más reciente: {fecha_str_disp})", 
+                               font=("Arial", 10, "bold"), foreground=color, background="#F0F4F8")
+        info_label.pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(frame, text="📐 Mediciones Detalladas por Punta:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+
+        # Tabla de mediciones detalladas
+        tree = ttk.Treeview(frame, columns=("Serie", "Punta", "Resultado", "Fecha"), show="headings", height=10)
+        tree.heading("Serie", text="Serie", anchor=tk.W)
+        tree.heading("Punta", text="Punta", anchor=tk.W)
+        tree.heading("Resultado", text="Resultado", anchor=tk.W)
+        tree.heading("Fecha", text="Fecha y Hora", anchor=tk.W)
+
+        tree.column("Serie", width=120, stretch=tk.NO)
+        tree.column("Punta", width=70, stretch=tk.NO)
+        tree.column("Resultado", width=100, stretch=tk.NO)
+        tree.column("Fecha", width=180, stretch=tk.NO)
+
+        df_procesado = self.last_geo_analysis_data['df_procesado']
+        serie_cable_actual = self.last_geo_analysis_data['serie_cable']
+
+        if df_procesado is not None and not df_procesado.empty:
+            df_filtrado_por_serie = df_procesado[df_procesado['Serie'] == serie_cable_actual].copy()
+            # Ordenar para mostrar la más reciente por punta al final o destacar
+            df_filtrado_por_serie = df_filtrado_por_serie.sort_values(by=['Punta', 'Timestamp'], ascending=[True, True])
+
+            for index, row in df_filtrado_por_serie.iterrows():
+                resultado = str(row['Resultado']).strip().upper() if row['Resultado'] else 'N/A'
+                fecha_str = row['Timestamp'].strftime("%d/%m/%Y %H:%M:%S") if row['Timestamp'] else 'N/A'
+                
+                tree.insert("", tk.END, values=(row['Serie'], row['Punta'], resultado, fecha_str), 
+                            tags=('pass_style' if resultado == 'PASS' else 'fail_style'))
+        
+        tree.tag_configure('pass_style', foreground='green')
+        tree.tag_configure('fail_style', foreground='red')
+
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        detalles_window.mainloop()
 
     def solicitar_contrasena(self):
         """Solicita la contraseña para acceder a la configuración de rutas."""
@@ -388,7 +644,7 @@ class VerificadorCables:
 
     def iniciar(self):
         self.root = tk.Tk()
-        self.root.title("Verificador de Estado de Cables")
+        self.root.title("Verificador de Estado de Cables - Versión 1.2")
         self.root.geometry("800x650")
         self.root.configure(bg="#F0F4F8") # Fondo principal más suave
         
@@ -409,8 +665,8 @@ class VerificadorCables:
         self.style.configure("TLabel", background="#F0F4F8", foreground="#2C3E50") # Color de texto más oscuro
         self.style.configure("TButton", font=("Arial", 10, "bold"), padding=8, relief="flat", borderwidth=0)
         self.style.map("TButton", 
-                       background=[('active', "#B98B99"), ('!disabled', "#DB3434")], # Azul para botones
-                       foreground=[('active', 'black'), ('!disabled', 'Black')])
+                       background=[('active', "#A0615E"), ('!disabled', "#CA364E")], # Azul para botones
+                       foreground=[('active', 'black'), ('!disabled', 'black')])
 
         # Estilo para el botón principal (si se volviera a usar)
         self.style.configure("Primary.TButton", 
@@ -457,6 +713,11 @@ class VerificadorCables:
                             relief="flat",
                             borderwidth=1,
                             bordercolor="#E0E0E0")
+
+        # Estilo para Treeview (tablas en ventanas de detalles)
+        self.style.configure("Treeview.Heading", font=("Arial", 9, "bold"), background="#E0E0E0", foreground="#2C3E50")
+        self.style.configure("Treeview", font=("Arial", 9), rowheight=25)
+        self.style.map("Treeview", background=[('selected', '#B0D7FF')]) # Selección de fila
         
         # Frame principal
         main_frame = ttk.Frame(self.root, padding=(20, 15), style="TFrame")
@@ -553,11 +814,15 @@ class VerificadorCables:
         self.resultado_text.tag_config("rojo", 
                                      foreground="#DC3545", # Rojo para FAIL
                                      font=("Arial", 10, "bold"))
+        # Tags para los enlaces clickeables (solo subrayado)
+        self.resultado_text.tag_config("ilrl_click", underline=1, font=("Arial", 10, "bold"))
+        self.resultado_text.tag_config("geo_click", underline=1, font=("Arial", 10, "bold"))
         
         # Mensaje inicial en el área de resultados
         self.resultado_text.insert(tk.END, "Bienvenido al Verificador de Cables.\n\n"
                                      "Ingrese la Orden de Trabajo y el Número de Serie para iniciar.\n"
-                                     "La verificación se realizará automáticamente al completar los 13 dígitos del número de serie.", "normal")
+                                     "La verificación se realizará automáticamente al completar los 13 dígitos del número de serie.\n\n"
+                                     "Haga click en los resultados 'APROBADO' o 'RECHAZADO' de ILRL o Geometría para ver los detalles.", "normal")
         self.resultado_text.config(state=tk.DISABLED) # Deshabilitar edición inicial
         
         # Barra de desplazamiento
@@ -577,7 +842,7 @@ class VerificadorCables:
             "2. Ingrese el número de serie completo del cable (13 dígitos)\n"
             "3. Revise las rutas de análisis que se mostrarán arriba\n"
             "4. La verificación se realizará automáticamente al completar el número de serie (13 dígitos).\n"
-            "5. Revise los resultados en la sección inferior"
+            "5. Revise los resultados en la sección inferior, y haga click en el estatus para ver detalles."
         )
         ttk.Label(instrucciones_frame, 
                 text=instrucciones, 
@@ -593,7 +858,7 @@ class VerificadorCables:
         
         # Botón para salir (Nuevo)
         exit_button = ttk.Button(button_exit_frame, 
-                                 text="🚫 Salir", 
+                                 text="🚫 Salir del Programa", 
                                  command=self.root.destroy, 
                                  style="TButton") # Usar estilo de botón general
         exit_button.pack(pady=5, ipadx=10, ipady=5)
@@ -603,7 +868,7 @@ class VerificadorCables:
         footer_frame.grid(row=6, column=0, columnspan=2, pady=(10, 0))
         
         ttk.Label(footer_frame, 
-                text="Sistema de Verificación de Cables v1.1 | Desarrollado por Paulo", 
+                text="Sistema de Verificación de Cables v1.2 | Desarrollado por Paulo", 
                 font=("Arial", 8), 
                 foreground="#6C757D", # Gris oscuro
                 background="#F0F4F8").pack()
