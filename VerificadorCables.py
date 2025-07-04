@@ -36,27 +36,30 @@ class VerificadorCables:
         # Nuevo caché para almacenar los detalles de los elementos de Treeview
         self.item_data_cache = {}
 
-
     def _init_database(self):
         """Inicializa la base de datos SQLite y crea la tabla si no existe."""
         conn = None
         try:
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
-            # MODIFICACIÓN: Se eliminó UNIQUE de serial_number
+            
+            # Eliminar tabla si existe (solo para desarrollo, puedes comentar esto después de la primera ejecución)
+            cursor.execute("DROP TABLE IF EXISTS cable_verifications")
+            
+            # Crear nueva tabla sin la restricción UNIQUE en serial_number
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS cable_verifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entry_date TEXT NOT NULL,
-                    serial_number TEXT NOT NULL, -- Ya no es UNIQUE, cada entrada es un nuevo intento
+                    serial_number TEXT NOT NULL,
                     ot_number TEXT NOT NULL,
                     overall_status TEXT NOT NULL,
                     ilrl_status TEXT,
                     ilrl_date TEXT,
                     geo_status TEXT,
                     geo_date TEXT,
-                    ilrl_details_json TEXT, -- Almacenar detalles como JSON string
-                    geo_details_json TEXT   -- Almacenar detalles como JSON string
+                    ilrl_details_json TEXT,
+                    geo_details_json TEXT
                 )
             """)
             conn.commit()
@@ -71,7 +74,7 @@ class VerificadorCables:
                                  geo_status, geo_date, geo_details):
         """
         Registra el resultado de la verificación de un cable en la base de datos.
-        Ahora siempre inserta un nuevo registro.
+        Ahora permite múltiples registros para el mismo número de serie.
         """
         conn = None
         try:
@@ -83,7 +86,6 @@ class VerificadorCables:
             ilrl_details_json = json.dumps(ilrl_details) if ilrl_details else None
             geo_details_json = json.dumps(geo_details) if geo_details else None
 
-            # MODIFICACIÓN: Ahora es un INSERT simple
             cursor.execute("""
                 INSERT INTO cable_verifications (entry_date, serial_number, ot_number, overall_status,
                                                  ilrl_status, ilrl_date, ilrl_details_json,
@@ -93,7 +95,6 @@ class VerificadorCables:
                   ilrl_status, ilrl_date, ilrl_details_json,
                   geo_status, geo_date, geo_details_json))
             conn.commit()
-            print(f"Registro para {serial_number} insertado correctamente.")
         except sqlite3.Error as e:
             messagebox.showerror("Error de Base de Datos", f"No se pudo registrar el resultado: {e}")
         finally:
@@ -204,7 +205,8 @@ class VerificadorCables:
                         lista_detalles_ilrl.append({
                             'linea': i - inicio + 1,
                             'resultado': resultado_linea,
-                            'fecha': fecha_str_linea
+                            'fecha': fecha_str_linea,
+                            'origen_archivo': os.path.basename(ruta)
                         })
                 except IndexError:
                     continue
@@ -331,7 +333,7 @@ class VerificadorCables:
                         'timestamp': medicion['Timestamp'].strftime("%d/%m/%Y %H:%M:%S") if medicion['Timestamp'] else 'N/A'
                     })
             
-            return resultados_por_serie, ultima_fecha_total, dict(detalles_geo_por_serie) # Convertir defaultdict a dict
+            return resultados_por_serie, ultima_fecha_total, dict(detalles_geo_por_serie)
         except Exception as e:
             print(f"Error leyendo {os.path.basename(ruta)}: {e}")
             return None, None, None
@@ -404,11 +406,9 @@ class VerificadorCables:
             return
         
         # --- Poka-Yoke: Validación de coincidencia OT y Número de Serie ---
-        # Extraer parte numérica de la OT
         match_ot = re.search(r'(\d+)', ot_numero)
         ot_numerico_parte = match_ot.group(1) if match_ot else None
 
-        # Extraer los primeros 9 dígitos del número de serie
         serie_ot_parte = serie_cable[:9] if len(serie_cable) >= 9 else None
 
         if ot_numerico_parte is None or serie_ot_parte is None or ot_numerico_parte != serie_ot_parte:
@@ -425,44 +425,126 @@ class VerificadorCables:
             self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
             self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
-            return # Detener la ejecución si no hay coincidencia
-
-        # --- Fin Poka-Yoke ---
+            return
 
         # --- Procesamiento ILRL ---
         serie_buscar_ilrl = serie_cable[-4:]
-        resultado_ilrl = "NO ENCONTRADO"
-        fecha_ilrl = None
-        ilrl_detalles_para_db = None
-        
+        ilrl_data = None  # Para archivos LC con 4 puntas
+        ilrl_lc_data = None  # (res, fecha, detalles_list) for LC file
+        ilrl_sc_data = None  # (res, fecha, detalles_list) for SC file
+        ilrl_file_path = None
+        ilrl_lc_file_path = None
+        ilrl_sc_file_path = None
+
         archivos_ilrl = self.buscar_archivos_ilrl(ot_numero)
+        
         if not archivos_ilrl:
-            self.resultado_text.config(state=tk.NORMAL)
-            self.resultado_text.delete(1.0, tk.END)
-            self.resultado_text.insert(tk.END, f"NO SE ENCONTRARON ARCHIVOS ILRL PARA LA OT {ot_numero}\n", "rojo")
-            self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
-            self.resultado_text.tag_unbind("geo_click", "<Button-1>")
-            self.resultado_text.config(state=tk.DISABLED)
-            # Log this as "NO ENCONTRADO" ILRL status, overall will be "NO ENCONTRADO" or "RECHAZADO" later
-            # We will log the overall status at the end after checking both ILRL and GEO
+            resultado_ilrl = "NO ENCONTRADO"
+            fecha_ilrl = None
+            ilrl_detalles_para_db = None
         else:
             for archivo in archivos_ilrl:
-                clave = self.extraer_clave_ilrl(os.path.basename(archivo))
+                base_name = os.path.basename(archivo)
+                clave = self.extraer_clave_ilrl(base_name)
+                
                 if clave and clave.split('-')[1] == serie_buscar_ilrl:
                     res, fecha, detalles_ilrl_list = self.leer_resultado_ilrl(archivo)
                     if res:
-                        resultado_ilrl = res
-                        fecha_ilrl = fecha
-                        self.last_ilrl_file_path = archivo # Almacenar la ruta para la interfaz
-                        ilrl_detalles_para_db = { # Preparar para DB
-                            'file_path': archivo,
-                            'resultado_general': res,
-                            'fecha_general': fecha,
-                            'detalles_lineas': detalles_ilrl_list
-                        }
-                        break
-        
-        self.last_ilrl_analysis_data = ilrl_detalles_para_db # Almacenar para la interfaz
+                        # Verificar si es un archivo LC con 4 puntas
+                        if len(detalles_ilrl_list) >= 4 and "-LC-" in base_name.upper():
+                            ilrl_data = (res, fecha, detalles_ilrl_list)
+                            ilrl_file_path = archivo
+                        elif "-LC-" in base_name.upper():
+                            ilrl_lc_data = (res, fecha, detalles_ilrl_list)
+                            ilrl_lc_file_path = archivo
+                        elif "-SC-" in base_name.upper():
+                            ilrl_sc_data = (res, fecha, detalles_ilrl_list)
+                            ilrl_sc_file_path = archivo
+            
+            # Consolidate ILRL results
+            resultado_ilrl = "NO ENCONTRADO" # Default
+            fecha_ilrl = None
+            ilrl_detalles_para_db = {
+                'lc_file': None,
+                'sc_file': None,
+                'overall_ilrl_status': None,
+                'latest_ilrl_date': None,
+                'combined_details': []
+            }
+
+            if ilrl_data:  # Caso de archivo LC con 4 puntas
+                resultado_ilrl = ilrl_data[0]
+                fecha_ilrl = ilrl_data[1]
+                ilrl_detalles_para_db['lc_file'] = {
+                    'file_path': ilrl_file_path,
+                    'resultado_general': resultado_ilrl,
+                    'fecha_general': fecha_ilrl,
+                    'detalles_lineas': ilrl_data[2]
+                }
+                ilrl_detalles_para_db['overall_ilrl_status'] = resultado_ilrl
+                ilrl_detalles_para_db['latest_ilrl_date'] = fecha_ilrl
+                ilrl_detalles_para_db['combined_details'] = ilrl_data[2]
+                self.last_ilrl_file_path = f"LC (4 puntas): {ilrl_file_path}"
+
+            elif ilrl_lc_data and ilrl_sc_data:  # Caso tradicional de 2 archivos
+                if ilrl_lc_data[0] == "APROBADO" and ilrl_sc_data[0] == "APROBADO":
+                    resultado_ilrl = "APROBADO"
+                else:
+                    resultado_ilrl = "RECHAZADO"
+
+                date1 = datetime.strptime(ilrl_lc_data[1], "%d/%m/%Y %H:%M") if ilrl_lc_data[1] != 'N/A' else datetime.min
+                date2 = datetime.strptime(ilrl_sc_data[1], "%d/%m/%Y %H:%M") if ilrl_sc_data[1] != 'N/A' else datetime.min
+                fecha_ilrl = max(date1, date2).strftime("%d/%m/%Y %H:%M")
+
+                ilrl_detalles_para_db['lc_file'] = {
+                    'file_path': ilrl_lc_file_path,
+                    'resultado_general': ilrl_lc_data[0],
+                    'fecha_general': ilrl_lc_data[1],
+                    'detalles_lineas': ilrl_lc_data[2]
+                }
+                ilrl_detalles_para_db['sc_file'] = {
+                    'file_path': ilrl_sc_file_path,
+                    'resultado_general': ilrl_sc_data[0],
+                    'fecha_general': ilrl_sc_data[1],
+                    'detalles_lineas': ilrl_sc_data[2]
+                }
+                ilrl_detalles_para_db['overall_ilrl_status'] = resultado_ilrl
+                ilrl_detalles_para_db['latest_ilrl_date'] = fecha_ilrl
+                ilrl_detalles_para_db['combined_details'] = sorted(ilrl_lc_data[2] + ilrl_sc_data[2], key=lambda x: x.get('linea', 0))
+                self.last_ilrl_file_path = f"LC: {ilrl_lc_file_path}\nSC: {ilrl_sc_file_path}"
+
+            elif ilrl_lc_data or ilrl_sc_data:
+                # Only one file (LC or SC) found and processed
+                resultado_ilrl = "RECHAZADO"
+                
+                if ilrl_lc_data:
+                    fecha_ilrl = ilrl_lc_data[1]
+                    ilrl_detalles_para_db['lc_file'] = {
+                        'file_path': ilrl_lc_file_path,
+                        'resultado_general': ilrl_lc_data[0],
+                        'fecha_general': ilrl_lc_data[1],
+                        'detalles_lineas': ilrl_lc_data[2]
+                    }
+                    ilrl_detalles_para_db['overall_ilrl_status'] = resultado_ilrl
+                    ilrl_detalles_para_db['latest_ilrl_date'] = fecha_ilrl
+                    ilrl_detalles_para_db['combined_details'] = ilrl_lc_data[2]
+                    self.last_ilrl_file_path = f"LC: {ilrl_lc_file_path}"
+                elif ilrl_sc_data:
+                    fecha_ilrl = ilrl_sc_data[1]
+                    ilrl_detalles_para_db['sc_file'] = {
+                        'file_path': ilrl_sc_file_path,
+                        'resultado_general': ilrl_sc_data[0],
+                        'fecha_general': ilrl_sc_data[1],
+                        'detalles_lineas': ilrl_sc_data[2]
+                    }
+                    ilrl_detalles_para_db['overall_ilrl_status'] = resultado_ilrl
+                    ilrl_detalles_para_db['latest_ilrl_date'] = fecha_ilrl
+                    ilrl_detalles_para_db['combined_details'] = ilrl_sc_data[2]
+                    self.last_ilrl_file_path = f"SC: {ilrl_sc_file_path}"
+            
+            # If neither LC nor SC found, resultado_ilrl remains "NO ENCONTRADO"
+
+        self.last_ilrl_analysis_data = ilrl_detalles_para_db
 
         # --- Procesamiento Geometría ---
         resultado_geo = "NO ENCONTRADO"
@@ -477,15 +559,14 @@ class VerificadorCables:
             self.resultado_text.tag_unbind("ilrl_click", "<Button-1>")
             self.resultado_text.tag_unbind("geo_click", "<Button-1>")
             self.resultado_text.config(state=tk.DISABLED)
-            # We will log the overall status at the end after checking both ILRL and GEO
         else:
             for archivo in archivos_geo:
                 res_dict, fecha, detalles_geo_dict = self.leer_resultado_geo(archivo)
                 if res_dict and serie_cable in res_dict:
                     resultado_geo = res_dict[serie_cable]
                     fecha_geo = fecha
-                    self.last_geo_file_path = archivo # Almacenar la ruta para la interfaz
-                    geo_detalles_para_db = { # Preparar para DB
+                    self.last_geo_file_path = archivo
+                    geo_detalles_para_db = {
                         'file_path': archivo,
                         'resultado_general': resultado_geo,
                         'fecha_general': fecha.strftime("%d/%m/%Y %H:%M:%S") if hasattr(fecha, 'strftime') else str(fecha),
@@ -493,16 +574,16 @@ class VerificadorCables:
                     }
                     break
         
-        self.last_geo_analysis_data = geo_detalles_para_db # Almacenar para la interfaz
+        self.last_geo_analysis_data = geo_detalles_para_db
 
         # --- Determinación del Estatus General y Registro en DB ---
         overall_status_db = "NO ENCONTRADO"
         if resultado_ilrl != "NO ENCONTRADO" and resultado_geo != "NO ENCONTRADO":
             overall_status_db = "APROBADO" if resultado_ilrl == "APROBADO" and resultado_geo == "APROBADO" else "RECHAZADO"
         elif resultado_ilrl != "NO ENCONTRADO" and resultado_geo == "NO ENCONTRADO":
-            overall_status_db = "RECHAZADO" # ILRL encontrado, pero GEO no -> estatus general rechazado
+            overall_status_db = "RECHAZADO"
         elif resultado_ilrl == "NO ENCONTRADO" and resultado_geo != "NO ENCONTRADO":
-            overall_status_db = "RECHAZADO" # GEO encontrado, pero ILRL no -> estatus general rechazado
+            overall_status_db = "RECHAZADO"
         
         # Log results to database
         self._log_verification_result(
@@ -566,6 +647,12 @@ class VerificadorCables:
 
         self.resultado_text.config(state=tk.DISABLED)
 
+    # [Resto de los métodos permanecen iguales...]
+    # mostrar_detalles_ilrl, mostrar_detalles_geo, solicitar_contrasena, 
+    # mostrar_ventana_configuracion_rutas, _borrar_todos_los_registros,
+    # solicitar_contrasena_borrar_datos, mostrar_vista_registros, cargar_registros,
+    # aplicar_filtro_registros, limpiar_filtro_registros
+
     def mostrar_detalles_ilrl(self, data=None):
         details_to_show = data if data else self.last_ilrl_analysis_data
 
@@ -582,34 +669,46 @@ class VerificadorCables:
         frame = ttk.Frame(detalles_window, padding=(20, 20), style="TFrame")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="📁 Archivo Analizado:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(10, 5))
-        ttk.Label(frame, text=details_to_show.get('file_path', 'N/A'), wraplength=800, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w", pady=(0, 10))
+        ttk.Label(frame, text="📁 Archivos Analizados:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(10, 5))
+        
+        lc_file_info = details_to_show.get('lc_file')
+        sc_file_info = details_to_show.get('sc_file')
+
+        if lc_file_info:
+            ttk.Label(frame, text=f"LC: {lc_file_info.get('file_path', 'N/A')}", wraplength=800, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w")
+        if sc_file_info:
+            ttk.Label(frame, text=f"SC: {sc_file_info.get('file_path', 'N/A')}", wraplength=800, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w")
+        if not lc_file_info and not sc_file_info:
+             ttk.Label(frame, text="N/A (Ningún archivo ILRL encontrado para esta serie)", wraplength=800, font=("Arial", 9), foreground="#6C757D", background="#F0F4F8").pack(anchor="w")
+
 
         ttk.Label(frame, text="📈 Resultado General ILRL:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
         
-        resultado_general = details_to_show.get('resultado_general', 'N/A')
-        fecha_general = details_to_show.get('fecha_general', 'N/A')
-        color = "green" if resultado_general == "APROBADO" else "red"
+        resultado_general = details_to_show.get('overall_ilrl_status', 'N/A')
+        fecha_general = details_to_show.get('latest_ilrl_date', 'N/A')
+        color = "green" if resultado_general == "APROBADO" else "red" if resultado_general == "RECHAZADO" else "orange"
         
         info_label = ttk.Label(frame, text=f"{resultado_general} (Fecha de medición más reciente: {fecha_general})", 
                                font=("Arial", 10, "bold"), foreground=color, background="#F0F4F8")
         info_label.pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(frame, text="📊 Mediciones Detalladas por Línea:", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
+        ttk.Label(frame, text="📊 Mediciones Detalladas por Línea (Combinado):", font=("Arial", 10, "bold"), foreground="#2C3E50", background="#F0F4F8").pack(anchor="w", pady=(0, 5))
 
-        tree = ttk.Treeview(frame, columns=("Línea", "Resultado", "Fecha"), show="headings", height=10)
+        tree = ttk.Treeview(frame, columns=("Línea", "Resultado", "Fecha", "Origen"), show="headings", height=10) # Added "Origen" column
         tree.heading("Línea", text="Línea", anchor=tk.W)
         tree.heading("Resultado", text="Resultado", anchor=tk.W)
         tree.heading("Fecha", text="Fecha", anchor=tk.W)
+        tree.heading("Origen", text="Origen", anchor=tk.W) # New heading
 
         tree.column("Línea", width=70, stretch=tk.NO)
         tree.column("Resultado", width=100, stretch=tk.NO)
         tree.column("Fecha", width=180, stretch=tk.NO)
+        tree.column("Origen", width=120, stretch=tk.NO) # New column width
 
-        detalles_lineas = details_to_show.get('detalles_lineas', [])
+        detalles_lineas = details_to_show.get('combined_details', [])
         for detalle in detalles_lineas:
             resultado = detalle.get('resultado', 'N/A')
-            tree.insert("", tk.END, values=(detalle.get('linea', 'N/A'), resultado, detalle.get('fecha', 'N/A')), 
+            tree.insert("", tk.END, values=(detalle.get('linea', 'N/A'), resultado, detalle.get('fecha', 'N/A'), detalle.get('origen_archivo', 'N/A')), 
                         tags=('pass_style' if resultado == 'PASS' else 'fail_style'))
         
         tree.tag_configure('pass_style', foreground='green')
@@ -988,12 +1087,31 @@ class VerificadorCables:
         ttk.Label(frame, text=f"   • Estado: {record_data['ilrl_status']}", font=("Arial", 10, "bold"), foreground=ilrl_status_color, background="#F0F4F8").pack(anchor="w")
         ttk.Label(frame, text=f"   • Fecha: {record_data['ilrl_date'] if record_data['ilrl_date'] else 'N/A'}", font=("Arial", 10), foreground="#6C757D", background="#F0F4F8").pack(anchor="w")
         
-        if record_data['ilrl_details'] and record_data['ilrl_details'].get('file_path'):
-            ttk.Label(frame, text=f"   • Archivo: {record_data['ilrl_details']['file_path']}", font=("Arial", 9), foreground="#6C757D", background="#F0F4F8", wraplength=700).pack(anchor="w")
-            btn_ver_detalles_ilrl = ttk.Button(frame, text="Ver Detalles ILRL (Ventana Completa)", 
-                                               command=lambda: self.mostrar_detalles_ilrl(record_data['ilrl_details']), 
-                                               style="Secondary.TButton")
-            btn_ver_detalles_ilrl.pack(anchor="w", pady=(5, 5))
+        # Check if ilrl_details contains the new structure (lc_file/sc_file)
+        ilrl_details_from_db = record_data['ilrl_details']
+        if ilrl_details_from_db:
+            lc_file_info = ilrl_details_from_db.get('lc_file')
+            sc_file_info = ilrl_details_from_db.get('sc_file')
+            
+            if lc_file_info:
+                ttk.Label(frame, text=f"   • Archivo LC: {lc_file_info.get('file_path', 'N/A')}", font=("Arial", 9), foreground="#6C757D", background="#F0F4F8", wraplength=700).pack(anchor="w")
+            if sc_file_info:
+                ttk.Label(frame, text=f"   • Archivo SC: {sc_file_info.get('file_path', 'N/A')}", font=("Arial", 9), foreground="#6C757D", background="#F0F4F8", wraplength=700).pack(anchor="w")
+            
+            if lc_file_info or sc_file_info:
+                btn_ver_detalles_ilrl = ttk.Button(frame, text="Ver Detalles ILRL (Ventana Completa)", 
+                                                command=lambda: self.mostrar_detalles_ilrl(ilrl_details_from_db), 
+                                                style="Secondary.TButton")
+                btn_ver_detalles_ilrl.pack(anchor="w", pady=(5, 5))
+            else: # Fallback for old structure or if paths are missing (single file entry)
+                if ilrl_details_from_db.get('file_path'): # This is for previous single-file format
+                    ttk.Label(frame, text=f"   • Archivo: {ilrl_details_from_db['file_path']}", font=("Arial", 9), foreground="#6C757D", background="#F0F4F8", wraplength=700).pack(anchor="w")
+                    btn_ver_detalles_ilrl = ttk.Button(frame, text="Ver Detalles ILRL (Ventana Completa)", 
+                                                    command=lambda: self.mostrar_detalles_ilrl(ilrl_details_from_db), 
+                                                    style="Secondary.TButton")
+                    btn_ver_detalles_ilrl.pack(anchor="w", pady=(5, 5))
+                else:
+                    ttk.Label(frame, text="   • No hay detalles ILRL disponibles.", font=("Arial", 10), foreground="#999999", background="#F0F4F8").pack(anchor="w")
         else:
             ttk.Label(frame, text="   • No hay detalles ILRL disponibles.", font=("Arial", 10), foreground="#999999", background="#F0F4F8").pack(anchor="w")
 
